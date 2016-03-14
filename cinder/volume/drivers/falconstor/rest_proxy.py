@@ -1,4 +1,4 @@
-# Copyright (c) 2015 FalconStor, Inc.
+# Copyright (c) 2016 FalconStor, Inc.
 # All Rights Reserved.
 #
 #    Licensed under the Apache License, Version 2.0 (the "License"); you may
@@ -173,7 +173,7 @@ class RESTProxy(object):
                       storage=dict(storagepoolid=self.fss_defined_pool,
                                    sizemb=sizemb),
                       automaticexpansion=dict(enabled=False),
-                      timeviewcopy=False,
+                      timeviewcopy=True,
                       cdpjournaltag=cdp_tag
                       )
         metadata = self.FSS.create_timeview(tv_vid, params)

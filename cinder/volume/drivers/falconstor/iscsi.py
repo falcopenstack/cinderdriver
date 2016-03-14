@@ -1,4 +1,4 @@
-# Copyright (c) 2015 FalconStor, Inc.
+# Copyright (c) 2016 FalconStor, Inc.
 # All Rights Reserved.
 #
 #    Licensed under the Apache License, Version 2.0 (the "License"); you may
@@ -28,7 +28,6 @@ from cinder.i18n import _, _LE, _LI, _LW
 from cinder.image import image_utils
 from cinder.volume import driver
 from cinder.volume.drivers.falconstor import rest_proxy
-from cinder.volume.drivers.san import san
 from oslo_utils import excutils
 from oslo_utils import units
 
@@ -36,11 +35,12 @@ from oslo_utils import units
 DEFAULT_ISCSI_PORT = 3260
 
 
-class FSSISCSIDriver(san.SanDriver,
+class FSSISCSIDriver(driver.BaseVD,
                      driver.ExtendVD,
                      driver.SnapshotVD,
                      driver.TransferVD,
                      driver.ConsistencyGroupVD):
+
     """Implements commands for FalconStor FSS ISCSI management.
 
     To enable the driver add the following line to the cinder configuration:
@@ -48,10 +48,11 @@ class FSSISCSIDriver(san.SanDriver,
 
     Version history:
         1.0.0 - Initial driver
+        1.0.1 - fixed  copy_image_to_volume error.
 
     """
 
-    VERSION = "1.0.0"
+    VERSION = "1.0.1"
 
     def __init__(self, *args, **kwargs):
         super(FSSISCSIDriver, self).__init__(*args, **kwargs)
@@ -129,7 +130,7 @@ class FSSISCSIDriver(san.SanDriver,
 
             fss_metadata.update(volume_metadata)
 
-        if 'metadata' in volume:
+        if 'metadata' in volume and type(volume['metadata']) is dict:
             fss_metadata.update(volume['metadata'])
         if "consistencygroup_id" in volume and \
                 volume['consistencygroup_id']:
@@ -398,14 +399,7 @@ class FSSISCSIDriver(san.SanDriver,
         self.proxy.unmanage(volume)
 
     def copy_image_to_volume(self, context, volume, image_service, image_id):
-        with image_utils.temporary_file() as tmp:
-            image_utils.fetch_verify_image(context, image_service,
-                                           image_id, tmp)
-        image_utils.fetch_to_raw(context,
-                                 image_service,
-                                 image_id,
-                                 tmp,
-                                 self.configuration.volume_dd_blocksize,
-                                 size=volume['size'])
-        volume_name = self.proxy._get_fss_volume_name(volume)
-        self.proxy._create_vdev_snapshot(volume_name, volume['size'])
+        super(FSSISCSIDriver, self).copy_image_to_volume(context, volume,
+                                                         image_service,
+                                                         image_id)
+
