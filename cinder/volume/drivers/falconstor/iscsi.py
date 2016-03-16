@@ -48,11 +48,13 @@ class FSSISCSIDriver(driver.BaseVD,
 
     Version history:
         1.0.0 - Initial driver
-        1.0.1 - fixed  copy_image_to_volume error.
+        1.0.1 - Fix copy_image_to_volume error.
+        1.0.2 - Closes-Bug #1554184, add lun id type conversion in
+                initialize_connection
 
     """
 
-    VERSION = "1.0.1"
+    VERSION = "1.0.2"
 
     def __init__(self, *args, **kwargs):
         super(FSSISCSIDriver, self).__init__(*args, **kwargs)
@@ -264,7 +266,7 @@ class FSSISCSIDriver(driver.BaseVD,
         properties['qos_specs'] = None
         properties['target_portal'] = target_portal
         properties['target_iqn'] = target_info['iqn']
-        properties['target_lun'] = target_info['lun']
+        properties['target_lun'] = int(target_info['lun'])
         properties['volume_id'] = volume['id']
         properties['access_mode'] = 'rw'
         return {'driver_volume_type': 'iscsi', 'data': properties}
