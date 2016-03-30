@@ -41,7 +41,7 @@ CONF.register_opts(FSS_OPTS)
 LOG = logging.getLogger(__name__)
 
 
-RETRY_LIST = ['2147680512']
+RETRY_LIST = ['107', '2147680512']
 RETRY_CNT = 5
 RETRY_INTERVAL = 15
 OPERATION_TIMEOUT = 60 * 60

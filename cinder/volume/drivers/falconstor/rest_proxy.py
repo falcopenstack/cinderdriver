@@ -150,32 +150,36 @@ class RESTProxy(object):
 
     def create_vdev(self, volume):
         sizemb = self._convert_size_to_mb(volume["size"])
+        volume_name = self._get_fss_volume_name(volume)
         params = dict(storagepoolid=self.fss_defined_pool,
                       category="virtual",
-                      sizemb=sizemb)
-        volume_name = self._get_fss_volume_name(volume)
-        params.update(name=volume_name)
+                      sizemb=sizemb,
+                      name=volume_name)
         return volume_name, self.FSS.create_vdev(params)
 
     def create_tv_from_cdp_tag(self, volume_metadata, volume):
         tv_vid = ''
         cdp_tag = ''
 
-        if 'timeview' in volume_metadata:
-            tv_vid = str(volume_metadata['timeview']) + '_0'
 
         if 'cdptag' in volume_metadata:
+            tv_vid = str(volume_metadata['timeview']) + '_0'
             cdp_tag = str(volume_metadata['cdptag'])
 
+        if 'rawtimestamp' in volume_metadata:
+            tv_vid = str(volume_metadata['timeview']) + '_' + \
+                     str(volume_metadata['rawtimestamp'])
         volume_name = self._get_fss_volume_name(volume)
         sizemb = self._convert_size_to_mb(volume['size'])
         params = dict(name=volume_name,
                       storage=dict(storagepoolid=self.fss_defined_pool,
                                    sizemb=sizemb),
                       automaticexpansion=dict(enabled=False),
-                      timeviewcopy=True,
-                      cdpjournaltag=cdp_tag
-                      )
+                      timeviewcopy=True)
+
+        if cdp_tag:
+            params.update(cdpjournaltag=cdp_tag)
+
         metadata = self.FSS.create_timeview(tv_vid, params)
         return volume_name, metadata
 
@@ -322,7 +326,7 @@ class RESTProxy(object):
                 vid, storagepoolid=self.fss_defined_pool)
 
         if not snap_name:
-            snap_name = "snap-%s" % time.strftime('%Y%m%d%H%m%S')
+            snap_name = "snap-%s" % time.strftime('%Y%m%d%H%M%S')
 
         self.FSS.create_timemark(vid, snap_name)
         snap_metadata['fss_tm_comment'] = snap_name
@@ -457,11 +461,11 @@ class RESTProxy(object):
         gid = self._get_fss_gid_from_name(group_name)
         return self.FSS.destroy_group(gid)
 
-    def _add_volume_to_consistency_group(self, group_name, vol_name):
-        self.set_group(group_name, addvollist=[vol_name])
+    def _add_volume_to_consistency_group(self, group_id, vol_name):
+        self.set_group(group_id, addvollist=[vol_name])
 
-    def set_group(self, group, **kwargs):
-        group_name = self._get_group_name_from_id(group['id'])
+    def set_group(self, group_id, **kwargs):
+        group_name = self._get_group_name_from_id(group_id)
         gid = self._get_fss_gid_from_name(group_name)
 
         join_params = dict()
@@ -676,9 +680,9 @@ class RESTProxy(object):
                 LOG.warning(_LW("Disconnection failed with message: "
                                 "%(msg)s."), {"msg": err.reason})
         finally:
-            (lun, target_name) = self.FSS._get_target_info(client_id, vid)
+            is_empty = self.FSS._check_host_mapping_status(client_id,target_id)
 
-            if lun == 0 and target_name is None:
+            if is_empty:
                 self.FSS.delete_iscsi_target(target_id)
                 self.FSS.delete_client(client_id)
 
@@ -791,6 +795,8 @@ class FSSRestCommon(object):
                 attempt += 1
                 LOG.warning(_LW("Retry with rc: %(msg)s."), {"msg": err_code})
                 self._random_sleep(RETRY_INTERVAL)
+                if err_code == 107:
+                    self.fss_login()
 
     def _random_sleep(self, interval=60):
         nsleep = random.randint(10, interval * 10)
@@ -1106,6 +1112,28 @@ class FSSRestCommon(object):
                         target_name = value
 
         return lun, target_name
+
+    def _check_host_mapping_status(self, client_id, target_id):
+        is_empty = False
+        hosting_cnt = 0
+        output = self.list_sanclient_info(client_id)
+        if 'data' not in output:
+            raise ValueError("No target in given data")
+        if 'iscsidevices' not in output['data']:
+            raise ValueError("No iscsidevices in given data")
+
+        if len(output['data']['iscsidevices']) == 0:
+            is_empty = True
+        else:
+            for iscsidevices in output['data']['iscsidevices']:
+                iscsitarget_info = iscsidevices['iscsitarget']
+                for key, value in iscsitarget_info.items():
+                    if key == 'id'and target_id == value:
+                        hosting_cnt += 1
+
+            if hosting_cnt == 0:
+                is_empty = True
+        return is_empty
 
     def list_iscsi_target_info(self, target_id=None):
         url = '%s/%s' % (FSS_CLIENT, FSS_ISCSI_TARGET)

@@ -15,7 +15,7 @@
 """
 Volume driver for FalconStor FSS storage system.
 
-This driver requires FSS version 8.5.0 or later.
+This driver requires FSS-8.00-8865 or later.
 """
 
 import math
@@ -35,11 +35,7 @@ from oslo_utils import units
 DEFAULT_ISCSI_PORT = 3260
 
 
-class FSSISCSIDriver(driver.BaseVD,
-                     driver.ExtendVD,
-                     driver.SnapshotVD,
-                     driver.TransferVD,
-                     driver.ConsistencyGroupVD):
+class FSSISCSIDriver(driver.VolumeDriver):
 
     """Implements commands for FalconStor FSS ISCSI management.
 
@@ -51,10 +47,13 @@ class FSSISCSIDriver(driver.BaseVD,
         1.0.1 - Fix copy_image_to_volume error.
         1.0.2 - Closes-Bug #1554184, add lun id type conversion in
                 initialize_connection
+        2.0.0 - Mitaka driver
+                -- fixed consisgroup commands error.
+		2.0.1 - fixed bugs
 
     """
 
-    VERSION = "1.0.2"
+    VERSION = "2.0.1"
 
     def __init__(self, *args, **kwargs):
         super(FSSISCSIDriver, self).__init__(*args, **kwargs)
@@ -110,18 +109,23 @@ class FSSISCSIDriver(driver.BaseVD,
         [Usage] create --volume-type FSS --metadata thinprovisioned=true
             thinsize=<thin-volume-size>
 
-        Create a LUN that is a Timeview of another LUN at a specified CDP tag
-        or Timemark :
+        Create a LUN that is a Timeview of another LUN at a specified CDP tag:
         [Usage] create --volume-type FSS --metadata timeview=<vid>
             cdptag=<tag> volume-size
+
+        Create a LUN that is a Timeview of another LUN at a specified Timemark:
+        [Usage] create --volume-type FSS --metadata timeview=<vid>
+            rawtimestamp=<rawtimestamp> volume-size
+
         """
 
         volume_metadata = self._get_volume_metadata(volume)
         if not volume_metadata:
             volume_name, fss_metadata = self.proxy.create_vdev(volume)
         else:
-            if 'timeview' in volume_metadata and 'cdptag' in volume_metadata:
-                volume_name, fss_metadata = self.proxy.create_tv_from_cdp_tag(
+            if 'timeview' in volume_metadata and ('cdptag' in volume_metadata or
+               'rawtimestamp' in volume_metadata):
+               volume_name, fss_metadata = self.proxy.create_tv_from_cdp_tag(
                     volume_metadata, volume)
             elif 'thinprovisioned' in volume_metadata and \
                  'thinsize' in volume_metadata:
@@ -133,13 +137,11 @@ class FSSISCSIDriver(driver.BaseVD,
             fss_metadata.update(volume_metadata)
 
         if 'metadata' in volume and type(volume['metadata']) is dict:
-            fss_metadata.update(volume['metadata'])
-        if "consistencygroup_id" in volume and \
-                volume['consistencygroup_id']:
-            group_name = self.proxy._get_group_name_from_id(
-                volume['consistencygroup_id'])
+                fss_metadata.update(volume['metadata'])
+
+        if volume['consistencygroup_id']:
             self.proxy._add_volume_to_consistency_group(
-                group_name,
+                volume['consistencygroup_id'],
                 volume_name
             )
         return {'metadata': fss_metadata}
@@ -162,10 +164,8 @@ class FSSISCSIDriver(driver.BaseVD,
         self.proxy.extend_vdev(new_vol_name, src_size, vol_size)
 
         if volume['consistencygroup_id']:
-            group_name = self.proxy._get_group_name_from_id(
-                volume['consistencygroup_id'])
             self.proxy._add_volume_to_consistency_group(
-                group_name,
+                volume['consistencygroup_id'],
                 new_vol_name
             )
         fss_metadata.update(volume['metadata'])
@@ -253,12 +253,7 @@ class FSSISCSIDriver(driver.BaseVD,
         LOG.info(("[initialize_connection]===\n"))
 
         target_info = self.proxy.initialize_connection_iscsi(volume, connector)
-        portal = self.proxy.get_default_portal()
-
-        if portal['rc'] == 0:
-            target_portal = '%s:%d' % (portal['ipaddress'], DEFAULT_ISCSI_PORT)
-        else:
-            target_portal = '%s:%d' % (self.host, DEFAULT_ISCSI_PORT)
+        target_portal = '%s:%d' % (self.configuration.san_ip, DEFAULT_ISCSI_PORT)
 
         properties = {}
         properties['target_discovered'] = False
@@ -308,17 +303,19 @@ class FSSISCSIDriver(driver.BaseVD,
         model_update = {'status': 'available'}
         return model_update
 
-    def delete_consistencygroup(self, context, group):
+    def delete_consistencygroup(self, context, group, volumes):
         """Deletes a consistency group."""
         self.proxy.destroy_group(group)
-        volumes = self.db.volume_get_all_by_group(context, group.get('id'))
-        if volumes:
-            for volume in volumes:
-                self.delete_volume(volume)
-                volume.status = 'deleted'
+        volume_updates = []
+        for volume in volumes:
+            self.delete_volume(volume)
+            volume_updates.append({
+                'id': volume.id,
+                'status': 'deleted'
+            })
 
         model_update = {'status': group.get('status')}
-        return model_update, volumes
+        return model_update, volume_updates
 
     def update_consistencygroup(self, context, group,
                                 add_volumes=None, remove_volumes=None):
@@ -332,11 +329,11 @@ class FSSISCSIDriver(driver.BaseVD,
             for volume in remove_volumes:
                 remvollist.append(self.proxy._get_fss_volume_name(volume))
 
-        self.proxy.set_group(group, addvollist=addvollist,
+        self.proxy.set_group(group['id'], addvollist=addvollist,
                              remvollist=remvollist)
         return None, None, None
 
-    def create_cgsnapshot(self, context, cgsnapshot):
+    def create_cgsnapshot(self, context, cgsnapshot, snapshots):
         """Creates a cgsnapshot."""
         cgsnapshot_id = cgsnapshot['id']
 
@@ -348,14 +345,16 @@ class FSSISCSIDriver(driver.BaseVD,
                                              'reason': six.text_type(e)}
             raise exception.VolumeBackendAPIException(data=msg)
 
-        snapshots = self.db.snapshot_get_all_for_cgsnapshot(
-            context, cgsnapshot_id)
+        snapshot_updates = []
         for snapshot in snapshots:
-            snapshot['status'] = 'available'
-        model_update = dict(status='available')
-        return model_update, snapshots
+            snapshot_updates.append({
+                'id': snapshot.id,
+                'status': 'available'
+            })
+        model_update = {'status': 'available'}
+        return model_update, snapshot_updates
 
-    def delete_cgsnapshot(self, context, cgsnapshot):
+    def delete_cgsnapshot(self, context, cgsnapshot, snapshots):
         """Deletes a cgsnapshot."""
         cgsnapshot_id = cgsnapshot['id']
         try:
@@ -363,22 +362,24 @@ class FSSISCSIDriver(driver.BaseVD,
         except Exception as e:
             msg = _('Failed to delete cgsnapshot %(id)s '
                     'due to %(reason)s.') % {'id': cgsnapshot_id,
-                                             'reason': six.text_type(e)}
+                    'reason': six.text_type(e)}
             raise exception.VolumeBackendAPIException(data=msg)
 
-        snapshots = self.db.snapshot_get_all_for_cgsnapshot(
-            context, cgsnapshot_id)
+        snapshot_updates = []
         for snapshot in snapshots:
-            snapshot['status'] = 'deleted'
-        model_update = dict(status=cgsnapshot['status'])
-        return model_update, snapshots
+            snapshot_updates.append({
+                'id': snapshot.id,
+                'status': 'deleted',
+            })
+
+        model_update = {'status': cgsnapshot.status}
+        return model_update, snapshot_updates
 
     def manage_existing(self, volume, existing_ref):
         """Convert an existing FSS volume to a Cinder volume.
 
         We expect a volume id in the existing_ref that matches one in FSS.
         """
-
         volume_metadata = {}
         self.proxy._get_existing_volume_ref_vid(existing_ref)
         self.proxy._manage_existing_volume(existing_ref['source-id'], volume)
