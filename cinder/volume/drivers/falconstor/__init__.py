@@ -18,18 +18,12 @@ from oslo_config import cfg
 from oslo_log import log as logging
 
 FSS_OPTS = [
-    cfg.StrOpt('san_ip',
-               default='127.0.0.1',
-               help='FSS server ip.'),
-    cfg.StrOpt('san_login',
-               default='username',
-               help='FSS login account.'),
-    cfg.StrOpt('san_password',
-               default='password',
-               help='FSS login password.'),
     cfg.IntOpt('fss_pool',
                default='',
                help='FSS pool id in which FalconStor volumes are stored.'),
+    cfg.BoolOpt('fss_debug',
+                default=False,
+                help="Enable HTTP debugging to FSS"),
     cfg.StrOpt('additional_retry_list',
                default='',
                help='FSS additional retry list, separate by ;')
@@ -39,7 +33,6 @@ CONF = cfg.CONF
 CONF.register_opts(FSS_OPTS)
 
 LOG = logging.getLogger(__name__)
-
 
 RETRY_LIST = ['107', '2147680512']
 RETRY_CNT = 5

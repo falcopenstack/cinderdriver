@@ -14,24 +14,27 @@
 #    under the License.
 
 import base64
-import httplib
 import json
 import random
 import time
 import uuid
 
-from __init__ import *  # NOQA
+from . import *  # NOQA
 from cinder import exception
 from cinder.i18n import _, _LE, _LI, _LW
+from oslo_log import log as logging
 from oslo_utils import excutils
 from oslo_utils import units
-
+from six.moves import http_client
 
 PRODUCT_NAME = 'ipstor'
 SESSION_COOKIE_NAME = 'session_id'
 MAXSNAPSHOTS = 1000
 FSS_BATCH = 'batch'
 FSS_PHYSICALRESOURCE = 'physicalresource'
+FSS_PHYSICALADAPTER = 'physicaladapter'
+FSS_FCCLIENTINITIATORS = 'fcclientinitiators'
+FSS_FC_TGT_WWPN = 'fctgtwwpn'
 FSS_STORAGE_POOL = 'storagepool'
 FSS_LOGICALRESOURCE = 'logicalresource'
 FSS_SAN = 'sanresource'
@@ -65,9 +68,7 @@ GROUP_PREFIX = 'OpenStack-'
 
 
 class RESTProxy(object):
-
     def __init__(self, config):
-
         self.fss_host = config.san_ip
         self.fss_username = config.san_login
         self.fss_password = config.san_password
@@ -76,7 +77,8 @@ class RESTProxy(object):
         self.FSS = FSSRestCommon(
             host=self.fss_host,
             username=self.fss_username,
-            password=self.fss_password)
+            password=self.fss_password,
+            fss_debug=config.fss_debug)
         self.session_id = None
 
     # naming
@@ -94,17 +96,12 @@ class RESTProxy(object):
     def _encode_name(self, name):
         uuid_str = name.replace("-", "")
         vol_uuid = uuid.UUID('urn:uuid:%s' % uuid_str)
-        snap_id_encoded = base64.b64encode(vol_uuid.bytes)
-        encoded_name = "".join(
-            i for i in snap_id_encoded if i not in "<>\"&$/\'")
-        newuuid = encoded_name.replace("=", "")
+        newuuid = (base64.urlsafe_b64encode(vol_uuid.bytes).
+                   decode('utf-8').strip('='))
         return "cinder-%s" % newuuid
 
     def do_setup(self):
         self.session_id = self.FSS.fss_login()
-
-    def list_pool_info(self, pool_id=None):
-        return self.FSS.list_pool_info(pool_id)
 
     def _convert_size_to_gb(self, size):
         s = round(float(size) / units.Gi, 2)
@@ -114,24 +111,23 @@ class RESTProxy(object):
             return 0
 
     def _convert_size_to_mb(self, size):
-        return int(size * units.Gi / 1024 / 1024)
+        return size * units.Ki
 
     def _get_pools_info(self):
-        # _get_capacity
         qpools = []
         poolinfo = {}
         try:
             output = self.list_pool_info()
             if "storagepools" in output['data']:
                 for item in output['data']['storagepools']:
-                    if item['name'].startswith(GROUP_PREFIX) and \
-                       self.fss_defined_pool == item['id']:
+                    if item['name'].startswith(GROUP_PREFIX) and self. \
+                            fss_defined_pool == item['id']:
                         poolid = int(item['id'])
                         qpools.append(poolid)
                         break
 
             if not qpools:
-                msg = ('The storage pool infomation is empty or not correct')
+                msg = 'The storage pool infomation is empty or not correct'
                 raise exception.DriverNotInitialized(msg)
 
             # Query pool detail information
@@ -148,6 +144,21 @@ class RESTProxy(object):
             LOG.error(_LE('Failed to get server info due to %s.'), e)
         return poolinfo
 
+    def list_pool_info(self, pool_id=None):
+        return self.FSS.list_pool_info(pool_id)
+
+    def list_physicaladapter_info(self, adapter_id=None):
+        return self.FSS.list_physicaladapter_info(adapter_id)
+
+    def _checking_adapter_type(self, id):
+        type = ''
+        output = self.list_physicaladapter_info()
+        if "physicaladapters" in output['data']:
+            physicaladapters = output['data']['physicaladapters']
+            if physicaladapters['id'] == id:
+                type = physicaladapters['type']
+        return type
+
     def create_vdev(self, volume):
         sizemb = self._convert_size_to_mb(volume["size"])
         volume_name = self._get_fss_volume_name(volume)
@@ -161,14 +172,13 @@ class RESTProxy(object):
         tv_vid = ''
         cdp_tag = ''
 
-
         if 'cdptag' in volume_metadata:
             tv_vid = str(volume_metadata['timeview']) + '_0'
             cdp_tag = str(volume_metadata['cdptag'])
 
         if 'rawtimestamp' in volume_metadata:
-            tv_vid = str(volume_metadata['timeview']) + '_' + \
-                     str(volume_metadata['rawtimestamp'])
+            tv_vid = '{0}_{1}'.format(str(volume_metadata['timeview']),
+                                      str(volume_metadata['rawtimestamp']))
         volume_name = self._get_fss_volume_name(volume)
         sizemb = self._convert_size_to_mb(volume['size'])
         params = dict(name=volume_name,
@@ -176,7 +186,6 @@ class RESTProxy(object):
                                    sizemb=sizemb),
                       automaticexpansion=dict(enabled=False),
                       timeviewcopy=True)
-
         if cdp_tag:
             params.update(cdpjournaltag=cdp_tag)
 
@@ -192,28 +201,26 @@ class RESTProxy(object):
 
         if 'thinprovisioned' in volume_metadata:
             if volume_metadata['thinprovisioned'] is False:
-                msg = ('If you want to create a thin provisioning volume,'
-                       ' this param must be True.')
+                msg = (_('If you want to create a thin provisioning volume,'
+                         ' this param must be True.'))
                 raise exception.VolumeBackendAPIException(msg)
 
         if 'thinsize' in volume_metadata:
             thin_size = int(volume_metadata['thinsize'])
 
         if size < 10:
-            msg = ('The resource is a thin device, minimum size is 10240 MB')
+            msg = _('The resource is a thin device, minimum size is 10240 MB')
             raise exception.VolumeBackendAPIException(msg)
         else:
             try:
                 if thin_size > size:
-                    msg = ('The allocated size must less than total size.')
+                    msg = _('The allocated size must less than total size.')
                     raise exception.VolumeBackendAPIException(msg)
-
             except Exception:
-                msg = ('The resource is a thin device, thin size is invalid.')
+                msg = _('The resource is a thin device, thin size is invalid.')
                 raise exception.VolumeBackendAPIException(msg)
 
             thin_size = self._convert_size_to_mb(thin_size)
-
             thin_disk = dict(
                 enabled=True,
                 fullsizemb=sizemb)
@@ -233,34 +240,37 @@ class RESTProxy(object):
                     if item['name'] in volume_name:
                         vid.append(item['id'])
         except Exception:
-            msg = ('Can not found cinder volume - %(volumeName)s' %
+            msg = (_('Can not found cinder volume - %(volumeName)s') %
                    {"volumeName": volume_name})
             raise exception.VolumeBackendAPIException(msg)
 
         if type is not None and type == FSS_SINGLE_TYPE:
             vid = ''.join(str(x) for x in vid)
-
         return vid
 
     def _get_fss_gid_from_name(self, group_name):
         gid = ''
         output = self.FSS.list_group_info()
-
         if "snapshotgroups" in output['data']:
             for item in output['data']['snapshotgroups']:
                 if item['name'] == group_name:
                     gid = item['id']
                     break
             if gid == '':
-                msg = ('Can not found consistency group - %(groupName)s' %
-                       {"groupName": group_name})
+                msg = (_('Can not found consistency group: %s') % group_name)
                 raise exception.VolumeBackendAPIException(msg)
         return gid
+
+    def _get_fss_group_membercount(self, gid):
+        membercount = 0
+        output = self.FSS.list_group_info(gid)
+        if "membercount" in output['data']:
+            membercount = output['data']['membercount']
+        return membercount
 
     def _get_vdev_id_from_group_id(self, group_id):
         vidlist = []
         output = self.FSS.list_group_info(group_id)
-
         if "virtualdevices" in output['data']:
             for item in output['data']['virtualdevices']:
                 vidlist.append(item['id'])
@@ -286,7 +296,6 @@ class RESTProxy(object):
 
         ret2 = self.FSS.sync_mirror(vid)
         self.FSS._random_sleep()
-
         if ret2['rc'] == 0:
             self.FSS._check_mirror_sync_finished(vid, OPERATION_TIMEOUT)
             ret3 = self.FSS.promote_mirror(vid, new_vol_name)
@@ -302,29 +311,27 @@ class RESTProxy(object):
         if vid:
             return self.FSS.delete_vdev(vid)
         else:
-            msg = ('vid is null. FSS failed to delete volume')
+            msg = _('vid is null. FSS failed to delete volume')
             raise exception.VolumeBackendAPIException(data=msg)
 
     def create_snapshot(self, snapshot):
         snap_metadata = {}
-
         volume_name = self._get_vol_name_from_snap(snapshot)
         snap_name = snapshot["display_name"]
         size = snapshot['volume_size']
         vid = self._get_fss_vid_from_name(volume_name, FSS_SINGLE_TYPE)
         if not vid:
-            msg = ('vid is null. FSS failed to create snapshot')
+            msg = _('vid is null. FSS failed to create snapshot')
             raise exception.VolumeBackendAPIException(data=msg)
 
-        (snap, tm_policy, vdev_size) = \
-            self.FSS._check_if_snapshot_tm_exist(vid)
+        (snap, tm_policy, vdev_size) = (self.FSS.
+                                        _check_if_snapshot_tm_exist(vid))
 
         if not snap:
             self.create_vdev_snapshot(vid, self._convert_size_to_mb(size))
         if not tm_policy:
             self.FSS.create_timemark_policy(
                 vid, storagepoolid=self.fss_defined_pool)
-
         if not snap_name:
             snap_name = "snap-%s" % time.strftime('%Y%m%d%H%M%S')
 
@@ -337,12 +344,11 @@ class RESTProxy(object):
         snap_name = snapshot["display_name"]
         vid = self._get_fss_vid_from_name(volume_name, FSS_SINGLE_TYPE)
         if not vid:
-            msg = ('vid is null. FSS failed to delete snapshot')
+            msg = _('vid is null. FSS failed to delete snapshot')
             raise exception.VolumeBackendAPIException(data=msg)
-
         if not snap_name:
-            if 'metadata' in snapshot and \
-               'fss_tm_comment' in snapshot['metadata']:
+            if ('metadata' in snapshot and
+               'fss_tm_comment' in snapshot['metadata']):
                 snap_name = snapshot['metadata']['fss_tm_comment']
 
         tm_info = self.FSS.get_timemark(vid)
@@ -352,7 +358,6 @@ class RESTProxy(object):
             self.FSS.delete_timemark(timestamp)
 
             final_tm_data = self.FSS.get_timemark(vid)
-
             if "timemark" in final_tm_data['data']:
                 if not final_tm_data['data']['timemark']:
                     self.FSS.delete_timemark_policy(vid)
@@ -374,19 +379,19 @@ class RESTProxy(object):
         new_vol_name = self._get_fss_volume_name(volume)
         vid = self._get_fss_vid_from_name(volume_name, FSS_SINGLE_TYPE)
         if not vid:
-            msg = ('vid is null. FSS failed to create_volume_from_snapshot.')
+            msg = _('vid is null. FSS failed to create_volume_from_snapshot.')
             raise exception.VolumeBackendAPIException(data=msg)
 
         if not snap_name:
-            if 'metadata' in snapshot and \
-               'fss_tm_comment' in snapshot['metadata']:
+            if ('metadata' in snapshot) and ('fss_tm_comment'
+                                             in snapshot['metadata']):
                 snap_name = snapshot['metadata']['fss_tm_comment']
 
         tm_info = self.FSS.get_timemark(vid)
         rawtimestamp = self._get_timestamp(tm_info, snap_name)
         if not rawtimestamp:
-            msg = ('rawtimestamp is null. '
-                   'FSS failed to create_volume_from_snapshot.')
+            msg = _('rawtimestamp is null. FSS failed to '
+                    'create_volume_from_snapshot.')
             raise exception.VolumeBackendAPIException(data=msg)
 
         timestamp = '%s_%s' % (vid, rawtimestamp)
@@ -395,7 +400,6 @@ class RESTProxy(object):
         if output['rc'] == 0:
             vid = output['id']
             self.FSS._random_sleep()
-
             if self.FSS._check_tm_copy_finished(vid, OPERATION_TIMEOUT):
                 volume_metadata['FSS-vid'] = vid
                 return volume_name, volume_metadata
@@ -420,11 +424,21 @@ class RESTProxy(object):
         )
         return self.FSS.rename_vdev(vid, params)
 
-    def assign_vdev(self, client_id, target_id, vid):
+    def assign_iscsi_vdev(self, client_id, target_id, vid):
         params = dict(
             action="assign",
             virtualdeviceids=[vid],
             iscsi=dict(target=target_id)
+        )
+        return self.FSS.assign_vdev(client_id, params)
+
+    def assign_fc_vdev(self, client_id, vid):
+        params = dict(
+            action="assign",
+            virtualdeviceids=[vid],
+            fc=dict(
+                fcmapping='alltoall',
+                accessmode='readwritenonexclusive')
         )
         return self.FSS.assign_vdev(client_id, params)
 
@@ -476,7 +490,6 @@ class RESTProxy(object):
                 action='join',
                 virtualdevices=joing_vid
             )
-
         if kwargs.get('remvollist'):
             leave_vid = self._get_fss_vid_from_name(kwargs['remvollist'])
             leave_params.update(
@@ -493,8 +506,8 @@ class RESTProxy(object):
         vidlist = self._get_vdev_id_from_group_id(gid)
 
         for vid in vidlist:
-            (snap, tm_policy, sizemb) = \
-                self.FSS._check_if_snapshot_tm_exist(vid)
+            (snap, tm_policy, sizemb) = (self.FSS.
+                                         _check_if_snapshot_tm_exist(vid))
             if not snap:
                 self.create_vdev_snapshot(vid, sizemb)
             if not tm_policy:
@@ -529,13 +542,14 @@ class RESTProxy(object):
         gid = self._get_fss_gid_from_name(group_name)
 
         if not gid:
-            msg = ('gid is null. FSS failed to delete cgsnapshot')
+            msg = _('gid is null. FSS failed to delete cgsnapshot')
             raise exception.VolumeBackendAPIException(data=msg)
 
-        tm_info = self.FSS.get_group_timemark(gid)
-        rawtimestamp = self._get_timestamp(tm_info, encode_snap_name)
-        timestamp = '%s_%s' % (gid, rawtimestamp)
-        self.delete_group_timemark(timestamp)
+        if self._get_fss_group_membercount(gid) != 0:
+            tm_info = self.FSS.get_group_timemark(gid)
+            rawtimestamp = self._get_timestamp(tm_info, encode_snap_name)
+            timestamp = '%s_%s' % (gid, rawtimestamp)
+            self.delete_group_timemark(timestamp)
 
         final_tm_data = self.FSS.get_group_timemark(gid)
         if "timemark" in final_tm_data['data']:
@@ -554,42 +568,50 @@ class RESTProxy(object):
             if not output['data']['iscsitarget']:
                 self.FSS.set_server_options('iscsitarget')
 
+    def _check_fc_target_option(self):
+        output = self.FSS.get_server_options()
+        if "fctarget" in output['data']:
+            if not output['data']['fctarget']:
+                self.FSS.set_server_options('fctarget')
+
+    def _check_iocluster_state(self):
+        output = self.FSS.get_server_options()
+        if 'iocluster' not in output['data']:
+            raise ValueError(_('No iocluster information in given data'))
+        return output['data']['iocluster']
+
+    def list_fc_target_wwpn(self):
+        return self.FSS.list_fc_target_wwpn()
+
+    def list_fc_client_initiators(self):
+        return self.FSS.list_fc_client_initiators()
+
+    def create_fc_client(self, cinder_host_name, free_initiator_wwpns):
+        client_id = 0
+        params = dict(
+            name=cinder_host_name,
+            protocoltype=["fc"],
+            ipaddress=self.fss_host,
+            ostype='linux',
+            fcpolicy=dict(
+                initiators=[free_initiator_wwpns],
+                vsaenabled=False
+            )
+        )
+        client_info = self.FSS.create_client(params)
+        if client_info and client_info['rc'] == 0:
+            client_id = client_info['id']
+        return client_id
+
     def list_iscsi_target_info(self, target_id=None):
         return self.FSS.list_iscsi_target_info(target_id)
 
-    def get_default_portal(self):
-        return self.FSS.get_default_portal()
-
-    def create_client(self, cinder_host_name, initiator):
-        params = dict(
-            name=cinder_host_name,
-            protocoltype=["iscsi"],
-            ipaddress=self.fss_host,
-            ostype='linux',
-            iscsipolicy=dict(
-                initiators=[initiator],
-                authentication=dict(enabled=False,
-                                    mutualchap=dict(enabled=False)
-                                    )
-            )
-        )
-        return self.FSS.create_client(params)
-
-    def create_iscsitarget(self, client_id, initiator):
-        params = dict(
-            clientid=client_id,
-            name=initiator,
-            ipaddress=[self.fss_host],
-            accessmode='readwrite'
-        )
-        return self.FSS.create_iscsitarget(params)
-
-    def _get_host(self, connector):
+    def _get_fc_host(self, connector):
         target_info = self.list_iscsi_target_info()
         if 'data' not in target_info:
-            raise ValueError("No data information in return info.")
+            raise ValueError(_('No data information in return info.'))
         if 'iscsitargets' not in target_info['data']:
-            raise ValueError("No iscsitargets in return info.")
+            raise ValueError(_('No iscsitargets in return info.'))
 
         if target_info['data']['iscsitargets']:
             iscsitargets = target_info['data']['iscsitargets']
@@ -600,87 +622,250 @@ class RESTProxy(object):
                     return client_id, target_id
         return None, None
 
-    def _create_host(self, host_name, initiator):
+    def _check_fc_host_devices_empty(self, client_id):
+        is_empty = False
+        output = self.FSS.list_sanclient_info(client_id)
+        if 'data' not in output:
+            raise ValueError(_('No target in given data'))
+        if 'fcdevices' not in output['data']:
+            raise ValueError(_('No fcdevices in given data'))
+
+        if len(output['data']['fcdevices']) == 0:
+            is_empty = True
+            self.FSS.delete_client(client_id)
+        return is_empty
+
+    def create_iscsi_client(self, cinder_host_name, initiator):
+        params = dict(
+            name=cinder_host_name,
+            protocoltype=["iscsi"],
+            ipaddress=self.fss_host,
+            ostype='linux',
+            iscsipolicy=dict(
+                initiators=[initiator],
+                authentication=dict(enabled=False,
+                                    mutualchap=dict(enabled=False))
+            )
+        )
+        return self.FSS.create_client(params)
+
+    def create_iscsitarget(self, client_id, initiator, fss_hosts):
+        params = dict(
+            clientid=client_id,
+            name=initiator,
+            ipaddress=fss_hosts,
+            accessmode='readwritenonexclusive'
+        )
+        return self.FSS.create_iscsitarget(params)
+
+    def _get_iscsi_host(self, connector):
+        target_info = self.list_iscsi_target_info()
+        if 'data' not in target_info:
+            raise ValueError(_('No data information in return info.'))
+        if 'iscsitargets' not in target_info['data']:
+            raise ValueError(_('No iscsitargets in return info.'))
+
+        if target_info['data']['iscsitargets']:
+            iscsitargets = target_info['data']['iscsitargets']
+            for iscsitarget in iscsitargets:
+                if connector["initiator"] in iscsitarget["name"]:
+                    target_id = iscsitarget["id"]
+                    client_id = iscsitarget["clientid"]
+                    return client_id, target_id
+        return None, None
+
+    def _create_iscsi_host(self, host_name, initiator, fss_hosts):
         client_id = ''
         target_id = ''
-        client_info = self.create_client(host_name, initiator)
-        if client_info:
-            if client_info['rc'] == 0:
-                client_id = client_info['id']
+        client_info = self.create_iscsi_client(host_name, initiator)
+        if client_info and client_info['rc'] == 0:
+            client_id = client_info['id']
 
-        target_info = self.create_iscsitarget(client_id, initiator)
-
+        target_info = self.create_iscsitarget(client_id, initiator, fss_hosts)
         if target_info['rc'] == 0:
             target_id = target_info['id']
         return client_id, target_id
 
-    def initialize_connection_iscsi(self, volume, connector):
+    def _get_fc_client_initiators(self, connector):
+        fc_initiators_assigned = []
+        fc_available_initiator = []
+        fc_initiators_info = self.list_fc_client_initiators()
+        if 'data' not in fc_initiators_info:
+            raise ValueError(_('No data information in return info.'))
+
+        if fc_initiators_info['data']:
+            fc_initiators = fc_initiators_info['data']
+            for fc_initiator in fc_initiators:
+                if fc_initiator['wwpn'] in connector['wwpns']:
+                    fc_available_initiator.append(str(fc_initiator['wwpn']))
+                    fc_initiators_assigned.append(dict(
+                        wwpn=str(fc_initiator['wwpn']),
+                        assigned=fc_initiator['assigned']))
+        return fc_available_initiator, fc_initiators_assigned
+
+    def fc_initialize_connection(self, volume, connector, fss_hosts):
+        """Connect the host and volume; return dict describing connection."""
+        vid = 0
+        fc_target_info = {}
+        free_fc_initiator = None
+
+        volume_name = self._get_fss_volume_name(volume)
+        vid = self._get_fss_vid_from_name(volume_name, FSS_SINGLE_TYPE)
+        if not vid:
+            msg = (_('Can not found cinder volume - %s') % volume_name)
+            raise exception.VolumeBackendAPIException(msg)
+
+        available_initiator, fc_initiators_info = (
+            self._get_fc_client_initiators(connector))
+
+        if fc_initiators_info is None:
+            msg = _('No FC initiator can be added to host.')
+            LOG.error(msg)
+            raise exception.VolumeBackendAPIException(data=msg)
+
+        for fc_initiator in fc_initiators_info:
+            value = fc_initiator['assigned']
+            if len(value) == 0:
+                free_fc_initiator = fc_initiator['wwpn']
+
+        if free_fc_initiator is None:
+            msg = _('No free FC initiator can be assigned to host.')
+            LOG.error(msg)
+            raise exception.VolumeBackendAPIException(data=msg)
+
+        initiator = connector["initiator"]
+        host_name = GROUP_PREFIX + '%s-' % connector["host"]
+
+        initiator_name = initiator.split(':')
+        idx = len(initiator_name) - 1
+        client_host_name = host_name + initiator_name[
+            idx] + '_FC-wwpn-' + free_fc_initiator
+
+        client_id = self.create_fc_client(client_host_name, free_fc_initiator)
+
+        try:
+            self.assign_fc_vdev(client_id, vid)
+            time.sleep(3)
+        except FSSHTTPError as err:
+            with excutils.save_and_reraise_exception() as ctxt:
+                if (err.code == 2415984845 and "XML_ERROR_CLIENT_EXIST"
+                                               in err.text):
+                    ctxt.reraise = False
+                LOG.warning(_LW('Assign volume failed with message: %(msg)s.'),
+                            {"msg": err.reason})
+        finally:
+            lun = self.FSS._get_fc_client_info(client_id, vid)
+
+            fc_target_info['lun'] = lun
+            fc_target_info['available_initiator'] = available_initiator
+
+        if not fc_target_info:
+            msg = _('Failed to get iSCSI target info for the LUN: %s')
+            raise exception.VolumeBackendAPIException(data=msg % volume_name)
+        return fc_target_info
+
+    def fc_terminate_connection(self, volume, connector):
+        client_id = 0
+        volume_name = self._get_fss_volume_name(volume)
+        vid = self._get_fss_vid_from_name(volume_name, FSS_SINGLE_TYPE)
+
+        output = self.list_volume_info(vid)
+        if 'data' not in output:
+            raise ValueError(_('No vdev information in given data'))
+        if 'clients' not in output['data']:
+            raise ValueError(_('No clients in vdev information.'))
+
+        client_info = output['data']['clients']
+
+        for fcclients in client_info:
+            client_id = int(fcclients['id'])
+
+        if client_id == 0:
+            msg = _(
+                'Can not found client id. The connection target name is %s')
+            raise exception.VolumeBackendAPIException(
+                data=msg % connector["initiator"])
+        try:
+            self.unassign_vdev(client_id, vid)
+        except FSSHTTPError as err:
+            with excutils.save_and_reraise_exception() as ctxt:
+                if (err.code == 2415984988 and
+                        "XML_ERROR_VIRTUAL_DEV_NOT_ASSIGNED_TO_iSCSI_TARGET"
+                        in err.text):
+                    ctxt.reraise = False
+                LOG.warning(_LW('Disconnection failed with message: '
+                                "%(msg)s."), {"msg": err.reason})
+        return client_id
+
+    def initialize_connection_iscsi(self, volume, connector, fss_hosts):
         """Connect the host and volume; return dict describing connection."""
         vid = 0
         iscsi_target_info = {}
         self._check_iscsi_option()
+        client_id, target_id = self._get_iscsi_host(connector)
 
-        client_id, target_id = self._get_host(connector)
         if target_id is None:
             initiator = connector["initiator"]
-            host_name = 'OpenStack-%s-' % connector["host"]
+            host_name = GROUP_PREFIX + '%s-' % connector["host"]
+
             initiator_info = initiator.split(':')
             idx = len(initiator_info) - 1
             client_host_name = host_name + initiator_info[idx]
-            client_id, target_id = self._create_host(
-                client_host_name, initiator)
 
+            client_id, target_id = self._create_iscsi_host(client_host_name,
+                                                           initiator,
+                                                           fss_hosts)
         volume_name = self._get_fss_volume_name(volume)
         try:
             vid = self._get_fss_vid_from_name(volume_name, FSS_SINGLE_TYPE)
             if not vid:
-                msg = ('Can not found cinder volume - %(volumeName)s' %
+                msg = (_('Can not found cinder volume - %(volumeName)s') %
                        {"volumeName": volume_name})
                 raise exception.VolumeBackendAPIException(msg)
 
-            self.assign_vdev(client_id, target_id, vid)
+            self.assign_iscsi_vdev(client_id, target_id, vid)
             time.sleep(3)
         except FSSHTTPError as err:
             with excutils.save_and_reraise_exception() as ctxt:
-                if err.code == 2415984989 and \
-                   "XML_ERROR_VIRTUAL_DEV_ASSIGNED_TO_iSCSI_TARGET" \
-                   in err.text:
+                if (err.code == 2415984989 and
+                        "XML_ERROR_VIRTUAL_DEV_ASSIGNED_TO_iSCSI_TARGET" in
+                        err.text):
                     ctxt.reraise = False
                 LOG.warning(_LW("Assign volume failed with message: %(msg)s."),
                             {"msg": err.reason})
         finally:
-            (lun, target_name) = self.FSS._get_target_info(client_id, vid)
+            (lun, target_name) = self.FSS._get_iscsi_target_info(client_id,
+                                                                 vid)
             iscsi_target_info['lun'] = lun
             iscsi_target_info['iqn'] = target_name
 
         if not iscsi_target_info:
             msg = _('Failed to get iSCSI target info for the LUN: %s')
             raise exception.VolumeBackendAPIException(data=msg % volume_name)
-
         return iscsi_target_info
 
     def terminate_connection_iscsi(self, volume, connector):
         volume_name = self._get_fss_volume_name(volume)
         vid = self._get_fss_vid_from_name(volume_name, FSS_SINGLE_TYPE)
-        client_id, target_id = self._get_host(connector)
+        client_id, target_id = self._get_iscsi_host(connector)
         if not client_id:
-            msg = _('Can not found client id. '
-                    'The connection target name is %s')
+            msg = _('Can not found client id. The connection target name '
+                    'is %s')
             raise exception.VolumeBackendAPIException(
                 data=msg % connector["initiator"])
-
         try:
             self.unassign_vdev(client_id, vid)
         except FSSHTTPError as err:
             with excutils.save_and_reraise_exception() as ctxt:
-                if err.code == 2415984988 and \
-                   "XML_ERROR_VIRTUAL_DEV_NOT_ASSIGNED_TO_iSCSI_TARGET" \
-                   in err.text:
+                if (err.code == 2415984988 and
+                        "XML_ERROR_VIRTUAL_DEV_NOT_ASSIGNED_TO_iSCSI_TARGET"
+                        in err.text):
                     ctxt.reraise = False
                 LOG.warning(_LW("Disconnection failed with message: "
                                 "%(msg)s."), {"msg": err.reason})
         finally:
-            is_empty = self.FSS._check_host_mapping_status(client_id,target_id)
+            is_empty = self.FSS._check_host_mapping_status(client_id,
+                                                           target_id)
 
             if is_empty:
                 self.FSS.delete_iscsi_target(target_id)
@@ -694,7 +879,6 @@ class RESTProxy(object):
                        "identify an existing volume.")
             raise exception.ManageExistingInvalidReference(
                 existing_ref=existing_ref, reason=reason)
-
         vdev_info = self.list_volume_info(vid)
         if not vdev_info:
             raise exception.ManageExistingInvalidReference(
@@ -702,9 +886,9 @@ class RESTProxy(object):
                 reason=_("Unable to find volume with FSS vid =%s") % vid)
 
         if 'data' not in vdev_info:
-            raise ValueError("No vdev information in given data")
+            raise ValueError(_('No vdev information in given data'))
         if 'sizemb' not in vdev_info['data']:
-            raise ValueError("No vdev sizemb in vdev information.")
+            raise ValueError(_('No vdev sizemb in vdev information.'))
 
         return vdev_info['data']['sizemb']
 
@@ -722,8 +906,6 @@ class RESTProxy(object):
     def unmanage(self, volume):
         volume_name = self._get_fss_volume_name(volume)
         unmanaged_vol_name = volume_name + "-unmanaged"
-        LOG.info(_LI("Renaming existing volume %(ref_name)s to %(new_name)s"),
-                 {"ref_name": volume_name, "new_name": unmanaged_vol_name})
         try:
             vid = self._get_fss_vid_from_name(volume_name, FSS_SINGLE_TYPE)
             self.rename_vdev(vid, unmanaged_vol_name)
@@ -733,12 +915,12 @@ class RESTProxy(object):
 
 
 class FSSRestCommon(object):
-
-    def __init__(self, host, username, password):
+    def __init__(self, host, username, password, fss_debug):
         self.hostip = host
         self.username = username
         self.password = password
         self.session_id = None
+        self.fss_debug = fss_debug
 
     def _fss_request(self, method, path, data=None):
         json_data = None
@@ -756,9 +938,16 @@ class FSSRestCommon(object):
         else:
             request_body = None
 
-        connection = httplib.HTTPConnection(self.hostip, 80, timeout=60)
-        attempt = 1
+        connection = http_client.HTTPConnection(self.hostip, 80, timeout=60)
 
+        if self.fss_debug:
+            LOG.info(_LI("[FSS_RESTAPI]====%(method)s@url=%(url)s ===="
+                         "@request_body=%(body)s===") % {
+                     "method": method,
+                     "url": url,
+                     "body": request_body})
+
+        attempt = 1
         while True:
             connection.request(method, url, request_body, headers)
             response = connection.getresponse()
@@ -770,13 +959,18 @@ class FSSRestCommon(object):
                     json_data = json.loads(json_data.decode('utf8'))
                 except ValueError:
                     pass
+
+            if self.fss_debug:
+                LOG.info(_LI("[FSS_RESTAPI]==@json_data: %s ==") % json_data)
+
             if response.status == 200:
                 return json_data
             elif response.status == 404:
-                msg = ('FSS rest api return failed, method=%(method)s, '
-                       'uri=%(url)s, response=%(response)s' %
-                       {"method": method, "url": url,
-                        "response": response_body})
+                msg = (_('FSS rest api return failed, method=%(method)s, '
+                         'uri=%(url)s, response=%(response)s') % {
+                       "method": method,
+                       "url": url,
+                       "response": response_body})
                 raise exception.VolumeBackendAPIException(msg)
             else:
                 err_code = json_data['rc']
@@ -793,7 +987,7 @@ class FSSRestCommon(object):
                     )
                     raise FSSHTTPError(err_target, err)
                 attempt += 1
-                LOG.warning(_LW("Retry with rc: %(msg)s."), {"msg": err_code})
+                LOG.warning(_LW("Retry with rc: %s."), err_code)
                 self._random_sleep(RETRY_INTERVAL)
                 if err_code == 107:
                     self.fss_login()
@@ -819,6 +1013,34 @@ class FSSRestCommon(object):
         return self.session_id
 
     #
+    # Physical Adapters management methods
+    #
+
+    def list_physicaladapter_info(self, adapter_id=None):
+        url = '%s/%s' % (FSS_PHYSICALRESOURCE, FSS_PHYSICALADAPTER)
+        if adapter_id is not None:
+            url = '%s/%s/%s' % (FSS_PHYSICALRESOURCE,
+                                FSS_PHYSICALADAPTER, adapter_id)
+        return self._fss_request(GET, url)
+
+    def list_fc_target_wwpn(self):
+        url = '%s/%s/%s' % (FSS_PHYSICALRESOURCE, FSS_PHYSICALADAPTER,
+                            FSS_FC_TGT_WWPN)
+        tgt_wwpn = []
+        output = self._fss_request(GET, url)
+        if output['data']:
+            tgt_wwpns = output['data']
+            for tgt_alias_wwpn in tgt_wwpns:
+                tgt_wwpn.append(
+                    str(tgt_alias_wwpn['aliaswwpn'].replace('-', '')))
+        return tgt_wwpn
+
+    def list_fc_client_initiators(self):
+        url = '%s/%s/%s' % (FSS_PHYSICALRESOURCE, FSS_PHYSICALADAPTER,
+                            FSS_FCCLIENTINITIATORS)
+        return self._fss_request(GET, url)
+
+    #
     # storage pool management methods
     #
 
@@ -828,6 +1050,10 @@ class FSSRestCommon(object):
             url = '%s/%s/%s' % (FSS_PHYSICALRESOURCE,
                                 FSS_STORAGE_POOL, pool_id)
         return self._fss_request(GET, url)
+
+    #
+    # Volume and snapshot management methods
+    #
 
     def create_vdev(self, params):
         metadata = {}
@@ -843,8 +1069,7 @@ class FSSRestCommon(object):
         while True:
             self._random_sleep()
             if time.time() > starttime + timeout:
-                msg = ('FSS get mirror sync timeout on vid: %(id)s ') % {
-                    'id': vid}
+                msg = (_('FSS get mirror sync timeout on vid: %s ') % vid)
                 raise exception.VolumeBackendAPIException(data=msg)
             elif self._check_mirror_sync_status(vid) is True:
                 break
@@ -876,13 +1101,11 @@ class FSSRestCommon(object):
                     if item['name'] in volume_name:
                         vid.append(item['id'])
         except Exception:
-            msg = ('Can not found cinder volume - %(volumeName)s' %
-                   {"volumeName": volume_name})
+            msg = (_('Can not found cinder volume - %s') % volume_name)
             raise exception.VolumeBackendAPIException(msg)
 
         if type is not None and type == FSS_SINGLE_TYPE:
             vid = ''.join(str(x) for x in vid)
-
         return vid
 
     def _check_if_snapshot_tm_exist(self, vid):
@@ -968,9 +1191,9 @@ class FSSRestCommon(object):
         output = self.get_timemark_copy_status(vid)
         if output['timemarkoperationstatus']:
             timemark_status = output['timemarkoperationstatus']
-            if timemark_status['operation'] == "copy" and \
-               timemark_status['status'] == 'completed':
-                finished = True
+            if timemark_status['operation'] == "copy":
+                if timemark_status['status'] == 'completed':
+                    finished = True
         return finished
 
     def _check_tm_copy_finished(self, vid, timeout):
@@ -979,8 +1202,7 @@ class FSSRestCommon(object):
         while True:
             self._random_sleep()
             if time.time() > starttime + timeout:
-                msg = ('FSS get timemark copy timeout on vid: %(id)s ') % {
-                    'id': vid}
+                msg = (_('FSS get timemark copy timeout on vid: %s') % vid)
                 raise exception.VolumeBackendAPIException(data=msg)
             elif self._check_tm_copy_status(vid) is True:
                 finished = True
@@ -1026,9 +1248,9 @@ class FSSRestCommon(object):
         output = self.get_mirror_sync_status(vid)
         if output['mirrorsyncstatus']:
             mirrorsyncstatus = output['mirrorsyncstatus']
-            if mirrorsyncstatus['status'] == "insync" and \
-               mirrorsyncstatus['percentage'] == 0:
-                finished = True
+            if mirrorsyncstatus['status'] == "insync":
+                if mirrorsyncstatus['percentage'] == 0:
+                    finished = True
         return finished
 
     def _set_mirror(self, vid, **kwargs):
@@ -1093,16 +1315,16 @@ class FSSRestCommon(object):
         url = '%s/%s/%s' % (FSS_CLIENT, FSS_SANCLIENT, client_id)
         return self._fss_request(PUT, url, params)
 
-    def _get_target_info(self, client_id, vid):
+    def _get_iscsi_target_info(self, client_id, vid):
         lun = 0
         target_name = None
         output = self.list_sanclient_info(client_id)
 
         if 'data' not in output:
-            raise ValueError("No target in given data")
-
+            raise ValueError(_('No target in given data'))
         if 'iscsidevices' not in output['data']:
-            raise ValueError("No iscsidevices in given data")
+            raise ValueError(_('No iscsidevices in given data'))
+
         for iscsidevices in output['data']['iscsidevices']:
             if int(vid) == int(iscsidevices['id']):
                 lun = iscsidevices['lun']
@@ -1118,9 +1340,9 @@ class FSSRestCommon(object):
         hosting_cnt = 0
         output = self.list_sanclient_info(client_id)
         if 'data' not in output:
-            raise ValueError("No target in given data")
+            raise ValueError(_('No target in given data'))
         if 'iscsidevices' not in output['data']:
-            raise ValueError("No iscsidevices in given data")
+            raise ValueError(_('No iscsidevices in given data'))
 
         if len(output['data']['iscsidevices']) == 0:
             is_empty = True
@@ -1128,7 +1350,7 @@ class FSSRestCommon(object):
             for iscsidevices in output['data']['iscsidevices']:
                 iscsitarget_info = iscsidevices['iscsitarget']
                 for key, value in iscsitarget_info.items():
-                    if key == 'id'and target_id == value:
+                    if key == 'id' and target_id == value:
                         hosting_cnt += 1
 
             if hosting_cnt == 0:
@@ -1148,9 +1370,9 @@ class FSSRestCommon(object):
         output = self.list_iscsi_target_info()
 
         if 'data' not in output:
-            raise ValueError("No target in given data")
+            raise ValueError(_('No target in given data'))
         if 'iscsitargets' not in output['data']:
-            raise ValueError("No iscsitargets for target")
+            raise ValueError(_('No iscsitargets for target'))
 
         for targets in output['data']['iscsitargets']:
             if 'name' in targets:
@@ -1158,7 +1380,6 @@ class FSSRestCommon(object):
                     target_id = str(targets['id'])
                     client_id = str(targets['clientid'])
                     break
-
         return target_id, client_id
 
     def create_iscsitarget(self, params):
@@ -1175,6 +1396,20 @@ class FSSRestCommon(object):
     def delete_client(self, client_id):
         url = '%s/%s/%s' % (FSS_CLIENT, FSS_SANCLIENT, client_id)
         return self._fss_request(DELETE, url)
+
+    def _get_fc_client_info(self, client_id, vid):
+        lun = 0
+        output = self.list_sanclient_info(client_id)
+        if 'data' not in output:
+            raise ValueError(_('No target in given data'))
+        if 'fcdevices' not in output['data']:
+            raise ValueError(_('No fcdevices in given data'))
+
+        for fcdevices in output['data']['fcdevices']:
+            if int(vid) == int(fcdevices['id']):
+                lun = fcdevices['lun']
+
+        return lun
 
     #
     # Group related methods
@@ -1208,7 +1443,6 @@ class FSSRestCommon(object):
         output = self.list_group_info(gid)
         if "timemarkenabled" in output['data']:
             timemarkenabled = output['data']['timemarkenabled']
-
         return timemarkenabled
 
     def create_group_timemark(self, gid, params):
@@ -1246,6 +1480,5 @@ class FSSRestCommon(object):
             if output['rc'] == 0:
                 return output
         except Exception:
-            msg = ('Can not found this error code:%(msg)s.' %
-                   {"msg": err_id})
+            msg = (_('Can not found this error code:%s.') % err_id)
             raise exception.APIException(reason=msg)
